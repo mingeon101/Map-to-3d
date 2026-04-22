@@ -1,33 +1,64 @@
 <!DOCTYPE html>
-<html>
+<html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>OpenBVE 노선 설계 도구</title>
+    <title>OpenBVE Pro Builder</title>
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
     <style>
-        body { margin: 0; display: flex; height: 100vh; }
-        #map { flex: 3; position: relative; }
-        #sidebar { flex: 1; padding: 20px; overflow-y: auto; background: #f8f9fa; border-left: 1px solid #ccc; font-size: 13px; }
-        .point-item { margin-bottom: 5px; padding: 5px; background: white; border: 1px solid #ddd; }
-        .controls { position: absolute; top: 10px; left: 10px; z-index: 5; background: white; padding: 10px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+        body { margin: 0; display: flex; height: 100vh; background: #121212; color: #fff; font-family: 'Segoe UI', sans-serif; }
+        #map { flex: 1; }
+        #sidebar { width: 360px; background: #1e1e1e; padding: 20px; display: flex; flex-direction: column; gap: 15px; border-right: 1px solid #333; }
+        .control-group { background: #2d2d2d; padding: 12px; border-radius: 8px; border-left: 4px solid #007bff; }
+        .toggle-container { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+        button { width: 100%; padding: 12px; margin-top: 10px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
+        .btn-gen { background: #27ae60; color: white; height: 50px; font-size: 1em; }
+        .status-box { font-size: 0.85em; color: #00ffcc; margin-top: 8px; line-height: 1.4; }
+        /* 간단한 토글 스위치 디자인 */
+        .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; transition: .4s; border-radius: 20px; }
+        input:checked + .slider { background-color: #007bff; }
+        .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider:before { transform: translateX(20px); }
     </style>
 </head>
 <body>
 
-<div id="map">
-    <div class="controls">
-        <strong>OpenBVE 노선 지정 모드</strong><br>
-        <small>지도 위를 클릭하여 노선 점을 찍으세요.</small><br>
-        <button onclick="clearPoints()">초기화</button>
-    </div>
-</div>
 <div id="sidebar">
-    <h3>📍 추출된 좌표 리스트</h3>
-    <div id="pointList"></div>
+    <h2>🛤️ BVE Pro Builder</h2>
+    
+    <div class="control-group">
+        <strong>설정</strong>
+        <div class="toggle-container">
+            <span>역 이름 자동 지정</span>
+            <label class="switch">
+                <input type="checkbox" id="autoNameToggle" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+        <small style="color:#888;">On: 클릭 지점의 지명을 역명으로 사용</small>
+    </div>
+
+    <div class="control-group">
+        <button style="background:#444; color:white;" onclick="mode='track'">🛤️ 선로 모드</button>
+        <button style="background:#f1c40f; color:black;" onclick="mode='station'">🚉 역사 모드</button>
+    </div>
+
+    <div class="status-box" id="status">
+        노선 지점: 0개<br>추출된 건물: 0개
+    </div>
+
+    <button class="btn-gen" onclick="buildBveFile()">OpenBVE 파일 내보내기 (.csv)</button>
 </div>
 
+<div id="map"></div>
+
 <script>
+    let mode = 'track';
+    let points = [];
+    let buildingsMap = new Map();
+
     const map = new maplibregl.Map({
         container: 'map',
         style: 'https://tiles.openfreemap.org/styles/liberty',
@@ -36,69 +67,104 @@
         pitch: 60
     });
 
-    let coordinates = [];
-
-    // 지도 클릭 이벤트
-    map.on('click', (e) => {
-        const { lng, lat } = e.lngLat;
-        coordinates.push([lng, lat]);
-
-        updateMap();
-        updateList();
+    map.on('load', () => {
+        map.addLayer({
+            'id': '3d-buildings',
+            'source': 'openmaptiles', 'source-layer': 'building',
+            'type': 'fill-extrusion',
+            'paint': {
+                'fill-extrusion-color': '#666',
+                'fill-extrusion-height': ['get', 'render_height'],
+                'fill-extrusion-opacity': 0.5
+            }
+        });
     });
 
-    function updateMap() {
-        // 기존 소스/레이어 제거 후 재생성 (단순화된 방식)
-        if (map.getSource('route')) {
-            map.removeLayer('route-line');
-            map.removeLayer('route-points');
-            map.removeSource('route');
+    map.on('click', async (e) => {
+        const { lng, lat } = e.lngLat;
+        let stationName = "";
+
+        // 자동 이름 지정 기능이 켜져 있고, 역사 모드일 때만 지명 검색
+        if (mode === 'station' && document.getElementById('autoNameToggle').checked) {
+            stationName = await getPlaceName(lng, lat);
+        } else if (mode === 'station') {
+            stationName = `Station_${points.filter(p => p.type === 'station').length + 1}`;
         }
 
-        map.addSource('route', {
-            'type': 'geojson',
-            'data': {
-                'type': 'FeatureCollection',
-                'features': [
-                    {
-                        'type': 'Feature',
-                        'geometry': { 'type': 'LineString', 'coordinates': coordinates }
-                    },
-                    ...coordinates.map(coord => ({
-                        'type': 'Feature',
-                        'geometry': { 'type': 'Point', 'coordinates': coord }
-                    }))
-                ]
+        const isWater = map.queryRenderedFeatures(e.point, { layers: ['water'] }).length > 0;
+        
+        points.push({ lng, lat, type: mode, isBridge: isWater, name: stationName });
+
+        // 주변 건물 추출 (반경 약 150m)
+        const features = map.queryRenderedFeatures([
+            [e.point.x - 100, e.point.y - 100],
+            [e.point.x + 100, e.point.y + 100]
+        ], { layers: ['3d-buildings'] });
+
+        features.forEach(f => {
+            if (!buildingsMap.has(f.id)) {
+                buildingsMap.set(f.id, {
+                    height: f.properties.render_height || 10,
+                    coords: f.geometry.coordinates[0][0]
+                });
             }
         });
 
-        map.addLayer({
-            'id': 'route-line',
-            'type': 'line',
-            'source': 'route',
-            'paint': { 'line-color': '#ff0000', 'line-width': 3 }
-        });
+        updateStatus();
+    });
 
-        map.addLayer({
-            'id': 'route-points',
-            'type': 'circle',
-            'source': 'route',
-            'paint': { 'circle-radius': 5, 'circle-color': '#007bff' }
-        });
+    // 역명을 가져오기 위한 무료 Reverse Geocoding (Nominatim)
+    async function getPlaceName(lng, lat) {
+        try {
+            const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18`);
+            const data = await res.json();
+            return data.display_name.split(',')[0] || "Unknown Station";
+        } catch (e) {
+            return "New Station";
+        }
     }
 
-    function updateList() {
-        const listDiv = document.getElementById('pointList');
-        listDiv.innerHTML = coordinates.map((c, i) => 
-            `<div class="point-item"><strong>${i}:</strong> ${c[0].toFixed(6)}, ${c[1].toFixed(6)}</div>`
-        ).join('');
+    function buildBveFile() {
+        let csv = "[Track]\n";
+        let dist = 0;
+        const start = points[0];
+
+        points.forEach((p, i) => {
+            if (i > 0) dist += getDistance(points[i-1], p);
+            let d = Math.floor(dist);
+            
+            csv += `${d}, .Rail(0;0)`;
+            if (p.isBridge) csv += `, .Structure.Put(2, 0, -1)`;
+            if (p.type === 'station') csv += `, .Station(${p.name}, 10, 0, 0, 1, 0, , , 0)`;
+            csv += "\n";
+        });
+
+        csv += "\n[Structure]\n";
+        buildingsMap.forEach(b => {
+            const x = (b.coords[0] - start.lng) * 88500;
+            const z = (b.coords[1] - start.lat) * 111000;
+            csv += `0, .Structure.Put(1, ${x.toFixed(1)}, 0, ${z.toFixed(1)})\n`;
+        });
+
+        const blob = new Blob([csv], { type: 'text/plain' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'bve_route_pro.csv';
+        link.click();
     }
 
-    function clearPoints() {
-        coordinates = [];
-        updateMap();
-        updateList();
+    function getDistance(p1, p2) {
+        const R = 6371e3;
+        const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+        const dLon = (p2.lng - p1.lng) * Math.PI / 180;
+        const a = Math.sin(dLat/2)**2 + Math.cos(p1.lat*Math.PI/180)*Math.cos(p2.lat*Math.PI/180)*Math.sin(dLon/2)**2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    function updateStatus() {
+        document.getElementById('status').innerHTML = `노선 지점: ${points.length}개<br>추출된 건물: ${buildingsMap.size}개`;
     }
 </script>
 </body>
 </html>
+
